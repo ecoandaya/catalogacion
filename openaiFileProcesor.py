@@ -6,9 +6,11 @@ import json
 import time
 import argparse
 import traceback
+import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
+import fitz  # PyMuPDF
 from openai import (
     OpenAI,
     RateLimitError,
@@ -17,6 +19,10 @@ from openai import (
     APIStatusError,
 )
 
+# Extensiones con lectura local directa
+LOCAL_TEXT_EXTENSIONS = {".pdf", ".txt", ".md", ".csv", ".json"}
+
+# Extensiones admitidas por defecto
 DEFAULT_EXTENSIONS = {
     ".pdf", ".txt", ".md", ".csv", ".json",
     ".docx", ".pptx", ".xlsx", ".rtf"
@@ -44,12 +50,19 @@ def append_jsonl(log_path: Path, record: dict) -> None:
 def append_csv(csv_path: Path, record: dict) -> None:
     ensure_parent_dir(csv_path)
     file_exists = csv_path.exists()
+
     fieldnames = [
         "status",
         "timestamp",
         "file_name",
         "file_path",
         "file_size_bytes",
+        "source_mode",
+        "extraction_method",
+        "pages",
+        "extracted_chars",
+        "text_truncated",
+        "needs_ocr",
         "remote_file_id",
         "model",
         "response_id",
@@ -58,6 +71,7 @@ def append_csv(csv_path: Path, record: dict) -> None:
         "error",
         "response_text",
     ]
+
     with csv_path.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -66,13 +80,166 @@ def append_csv(csv_path: Path, record: dict) -> None:
         writer.writerow(row)
 
 
+def parse_extensions(ext_string: Optional[str]) -> Optional[set[str]]:
+    if not ext_string:
+        return None
+    parts = [x.strip().lower() for x in ext_string.split(",") if x.strip()]
+    normalized = set()
+    for p in parts:
+        normalized.add(p if p.startswith(".") else f".{p}")
+    return normalized
+
+
+def print_progress(current: int, total: int, filename: str) -> None:
+    width = 28
+    ratio = current / total if total else 1
+    done = int(width * ratio)
+    bar = "#" * done + "-" * (width - done)
+    print(f"[{current}/{total}] [{bar}] {filename}")
+
+
+def make_prompt(prompt_template: str, filename: str, filepath: Path) -> str:
+    return prompt_template.format(
+        filename=filename,
+        filepath=str(filepath),
+        stem=filepath.stem,
+        suffix=filepath.suffix,
+    )
+
+
+def clean_extracted_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def text_is_usable(text: str, min_chars: int = 300) -> bool:
+    return len(text.strip()) >= min_chars
+
+
+def truncate_text(text: str, max_chars: int = 50000) -> Tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def extract_text_from_pdf(filepath: Path) -> Tuple[str, int]:
+    """
+    Extrae texto de un PDF usando PyMuPDF.
+    Devuelve (texto, num_paginas).
+    """
+    doc = fitz.open(filepath)
+    parts = []
+    try:
+        page_count = len(doc)
+        for page in doc:
+            txt = page.get_text("text")
+            if txt:
+                parts.append(txt)
+    finally:
+        doc.close()
+
+    text = "\n".join(parts).strip()
+    return text, page_count
+
+
+def read_text_file(filepath: Path) -> str:
+    return filepath.read_text(encoding="utf-8", errors="replace")
+
+
+def save_extracted_text(output_dir: Path, filepath: Path, text: str) -> Path:
+    ensure_parent_dir(output_dir / "dummy")
+    out_name = filepath.name + ".txt"
+    out_path = output_dir / out_name
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write(text)
+    return out_path
+
+
+def extract_text_locally(
+    filepath: Path,
+    min_chars: int = 300,
+    max_chars: int = 50000,
+    save_text_dir: Optional[Path] = None,
+) -> dict:
+    """
+    Intenta extraer texto localmente según el tipo de archivo.
+
+    Devuelve un diccionario con:
+    - ok
+    - text
+    - pages
+    - extracted_chars
+    - text_truncated
+    - needs_ocr
+    - source_mode
+    - extraction_method
+    - saved_text_path
+    """
+    suffix = filepath.suffix.lower()
+
+    result = {
+        "ok": False,
+        "text": "",
+        "pages": "",
+        "extracted_chars": 0,
+        "text_truncated": False,
+        "needs_ocr": False,
+        "source_mode": "",
+        "extraction_method": "",
+        "saved_text_path": "",
+    }
+
+    if suffix == ".pdf":
+        raw_text, pages = extract_text_from_pdf(filepath)
+        cleaned = clean_extracted_text(raw_text)
+
+        result["pages"] = pages
+        result["extracted_chars"] = len(cleaned)
+        result["source_mode"] = "pdf_local_text"
+        result["extraction_method"] = "pymupdf"
+
+        if text_is_usable(cleaned, min_chars=min_chars):
+            final_text, was_truncated = truncate_text(cleaned, max_chars=max_chars)
+            result["ok"] = True
+            result["text"] = final_text
+            result["text_truncated"] = was_truncated
+            result["needs_ocr"] = False
+        else:
+            result["ok"] = False
+            result["text"] = cleaned
+            result["text_truncated"] = False
+            result["needs_ocr"] = True
+
+    elif suffix in {".txt", ".md", ".csv", ".json"}:
+        raw_text = read_text_file(filepath)
+        cleaned = clean_extracted_text(raw_text)
+        final_text, was_truncated = truncate_text(cleaned, max_chars=max_chars)
+
+        result["ok"] = text_is_usable(cleaned, min_chars=min_chars)
+        result["text"] = final_text
+        result["pages"] = ""
+        result["extracted_chars"] = len(cleaned)
+        result["text_truncated"] = was_truncated
+        result["needs_ocr"] = False
+        result["source_mode"] = "local_text"
+        result["extraction_method"] = "read_text"
+
+    if save_text_dir and result["text"]:
+        out_path = save_extracted_text(save_text_dir, filepath, result["text"])
+        result["saved_text_path"] = str(out_path)
+
+    return result
+
+
 def extract_text_from_response(response) -> str:
-    # Ruta preferente del SDK moderno
     text = getattr(response, "output_text", None)
     if text:
         return text.strip()
 
-    # Fallbacks por robustez
     data = None
     try:
         data = response.model_dump()
@@ -99,28 +266,41 @@ def extract_text_from_response(response) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+def ask_about_text(
+    client: OpenAI,
+    model: str,
+    text: str,
+    prompt_template: str,
+    filename: str,
+    filepath: Path,
+    extra_instructions: Optional[str] = None,
+):
+    prompt = make_prompt(prompt_template, filename, filepath)
+
+    full_input = (
+        f"{prompt}\n\n"
+        f"=== NOMBRE DEL ARCHIVO ===\n{filename}\n\n"
+        f"=== RUTA DEL ARCHIVO ===\n{filepath}\n\n"
+        f"=== CONTENIDO DEL DOCUMENTO ===\n{text}"
+    )
+
+    kwargs = {
+        "model": model,
+        "input": full_input,
+    }
+
+    if extra_instructions:
+        kwargs["instructions"] = extra_instructions
+
+    return client.responses.create(**kwargs)
+
+
 def upload_file(client: OpenAI, filepath: Path):
     with filepath.open("rb") as f:
         return client.files.create(file=f, purpose="user_data")
 
 
-def delete_remote_file(client: OpenAI, file_id: str) -> None:
-    try:
-        client.files.delete(file_id)
-    except Exception:
-        pass
-
-
-def make_prompt(prompt_template: str, filename: str, filepath: Path) -> str:
-    return prompt_template.format(
-        filename=filename,
-        filepath=str(filepath),
-        stem=filepath.stem,
-        suffix=filepath.suffix,
-    )
-
-
-def ask_about_file(
+def ask_about_uploaded_file(
     client: OpenAI,
     model: str,
     file_id: str,
@@ -150,15 +330,23 @@ def ask_about_file(
     return client.responses.create(**kwargs)
 
 
+def delete_remote_file(client: OpenAI, file_id: str) -> None:
+    try:
+        client.files.delete(file_id)
+    except Exception:
+        pass
+
+
 def call_with_retries(fn, max_retries: int = 5, base_sleep: float = 2.0):
     """
     Reintenta errores transitorios.
-    No reintenta quota insuficiente.
+    No reintenta insufficient_quota.
     """
     attempt = 0
     while True:
         try:
             return fn()
+
         except RateLimitError as e:
             msg = str(e)
             if "insufficient_quota" in msg:
@@ -179,7 +367,6 @@ def call_with_retries(fn, max_retries: int = 5, base_sleep: float = 2.0):
             time.sleep(sleep_s)
 
         except APIStatusError as e:
-            # Reintentar 5xx; 4xx no salvo rate limit ya tratado arriba
             status_code = getattr(e, "status_code", None)
             if status_code and 500 <= status_code <= 599:
                 attempt += 1
@@ -192,27 +379,32 @@ def call_with_retries(fn, max_retries: int = 5, base_sleep: float = 2.0):
             raise
 
 
-def parse_extensions(ext_string: Optional[str]) -> Optional[set[str]]:
-    if not ext_string:
-        return None
-    parts = [x.strip().lower() for x in ext_string.split(",") if x.strip()]
-    normalized = set()
-    for p in parts:
-        normalized.add(p if p.startswith(".") else f".{p}")
-    return normalized
-
-
-def print_progress(current: int, total: int, filename: str) -> None:
-    width = 28
-    ratio = current / total if total else 1
-    done = int(width * ratio)
-    bar = "#" * done + "-" * (width - done)
-    print(f"[{current}/{total}] [{bar}] {filename}")
+def build_record_base(filepath: Path, model: str) -> dict:
+    return {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "file_name": filepath.name,
+        "file_path": str(filepath),
+        "file_size_bytes": filepath.stat().st_size if filepath.exists() else "",
+        "source_mode": "",
+        "extraction_method": "",
+        "pages": "",
+        "extracted_chars": 0,
+        "text_truncated": False,
+        "needs_ocr": False,
+        "saved_text_path": "",
+        "remote_file_id": "",
+        "model": model,
+        "response_id": "",
+        "elapsed_seconds": 0.0,
+        "error_type": "",
+        "error": "",
+        "response_text": "",
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sube archivos a OpenAI, consulta cada archivo y registra resultados."
+        description="Procesa archivos con OpenAI usando extracción local de texto cuando sea posible."
     )
     parser.add_argument("folder", help="Carpeta con archivos a procesar")
     parser.add_argument(
@@ -254,7 +446,7 @@ def main():
     parser.add_argument(
         "--delete-remote",
         action="store_true",
-        help="Eliminar de OpenAI cada archivo tras procesarlo",
+        help="Eliminar de OpenAI cada archivo remoto tras procesarlo",
     )
     parser.add_argument(
         "--sleep",
@@ -279,6 +471,28 @@ def main():
         default=None,
         help="Filtrar extensiones, separadas por comas. Ej: pdf,txt,docx",
     )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=50000,
+        help="Máximo de caracteres a enviar cuando se use extracción local",
+    )
+    parser.add_argument(
+        "--min-chars",
+        type=int,
+        default=300,
+        help="Mínimo de caracteres para considerar útil un texto extraído",
+    )
+    parser.add_argument(
+        "--save-extracted-text",
+        default=None,
+        help="Directorio opcional donde guardar el texto extraído",
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="No subir archivos. Si no se puede extraer texto localmente, registrar error.",
+    )
 
     args = parser.parse_args()
 
@@ -290,6 +504,7 @@ def main():
     folder = Path(args.folder).expanduser().resolve()
     log_path = Path(args.log).expanduser().resolve()
     csv_path = Path(args.csv).expanduser().resolve() if args.csv else None
+    save_text_dir = Path(args.save_extracted_text).expanduser().resolve() if args.save_extracted_text else None
 
     if not folder.exists() or not folder.is_dir():
         print(f"Error: la carpeta no existe o no es válida: {folder}", file=sys.stderr)
@@ -311,53 +526,99 @@ def main():
     print(f"Log JSONL: {log_path}")
     if csv_path:
         print(f"Log CSV:   {csv_path}")
+    if save_text_dir:
+        print(f"Texto extraído: {save_text_dir}")
 
     quota_exhausted = False
 
     for idx, filepath in enumerate(files, start=1):
         start_ts = time.time()
-        remote_file_id = None
-        response_id = None
+        remote_file_id = ""
+        response_id = ""
 
         print_progress(idx, total, filepath.name)
+        record = build_record_base(filepath, args.model)
 
         try:
-            uploaded = call_with_retries(
-                lambda: upload_file(client, filepath),
-                max_retries=args.retries
-            )
-            remote_file_id = uploaded.id
+            suffix = filepath.suffix.lower()
 
-            response = call_with_retries(
-                lambda: ask_about_file(
-                    client=client,
-                    model=args.model,
-                    file_id=remote_file_id,
-                    prompt_template=args.prompt,
-                    filename=filepath.name,
+            # 1) Intentar extracción local cuando proceda
+            used_local_extraction = suffix in LOCAL_TEXT_EXTENSIONS
+
+            if used_local_extraction:
+                extraction = extract_text_locally(
                     filepath=filepath,
-                    extra_instructions=args.instructions,
-                ),
-                max_retries=args.retries
-            )
+                    min_chars=args.min_chars,
+                    max_chars=args.max_chars,
+                    save_text_dir=save_text_dir,
+                )
 
-            response_id = getattr(response, "id", None)
-            text = extract_text_from_response(response)
+                record["source_mode"] = extraction["source_mode"]
+                record["extraction_method"] = extraction["extraction_method"]
+                record["pages"] = extraction["pages"]
+                record["extracted_chars"] = extraction["extracted_chars"]
+                record["text_truncated"] = extraction["text_truncated"]
+                record["needs_ocr"] = extraction["needs_ocr"]
+                record["saved_text_path"] = extraction["saved_text_path"]
 
-            record = {
-                "status": "ok",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "file_name": filepath.name,
-                "file_path": str(filepath),
-                "file_size_bytes": filepath.stat().st_size,
-                "remote_file_id": remote_file_id,
-                "model": args.model,
-                "response_id": response_id,
-                "elapsed_seconds": round(time.time() - start_ts, 3),
-                "error_type": "",
-                "error": "",
-                "response_text": text,
-            }
+                if extraction["ok"]:
+                    response = call_with_retries(
+                        lambda: ask_about_text(
+                            client=client,
+                            model=args.model,
+                            text=extraction["text"],
+                            prompt_template=args.prompt,
+                            filename=filepath.name,
+                            filepath=filepath,
+                            extra_instructions=args.instructions,
+                        ),
+                        max_retries=args.retries
+                    )
+
+                    response_id = getattr(response, "id", "")
+                    record["response_id"] = response_id
+                    record["response_text"] = extract_text_from_response(response)
+                    record["status"] = "ok"
+
+                else:
+                    if suffix == ".pdf" and extraction["needs_ocr"]:
+                        raise ValueError("PDF sin texto extraíble suficiente; probablemente necesita OCR")
+                    raise ValueError("Texto extraído insuficiente o vacío")
+
+            else:
+                # 2) Si no hay extracción local, usar subida de archivo salvo que se fuerce text-only
+                if args.text_only:
+                    raise ValueError("No se puede extraer texto localmente para este tipo y se ha activado --text-only")
+
+                uploaded = call_with_retries(
+                    lambda: upload_file(client, filepath),
+                    max_retries=args.retries
+                )
+                remote_file_id = uploaded.id
+
+                record["source_mode"] = "uploaded_file"
+                record["extraction_method"] = "openai_file_upload"
+                record["remote_file_id"] = remote_file_id
+
+                response = call_with_retries(
+                    lambda: ask_about_uploaded_file(
+                        client=client,
+                        model=args.model,
+                        file_id=remote_file_id,
+                        prompt_template=args.prompt,
+                        filename=filepath.name,
+                        filepath=filepath,
+                        extra_instructions=args.instructions,
+                    ),
+                    max_retries=args.retries
+                )
+
+                response_id = getattr(response, "id", "")
+                record["response_id"] = response_id
+                record["response_text"] = extract_text_from_response(response)
+                record["status"] = "ok"
+
+            record["elapsed_seconds"] = round(time.time() - start_ts, 3)
 
             append_jsonl(log_path, record)
             if csv_path:
@@ -377,20 +638,13 @@ def main():
             else:
                 human_msg = f"Rate limit excedido: {msg}"
 
-            record = {
-                "status": "error",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "file_name": filepath.name,
-                "file_path": str(filepath),
-                "file_size_bytes": filepath.stat().st_size if filepath.exists() else "",
-                "remote_file_id": remote_file_id,
-                "model": args.model,
-                "response_id": response_id,
-                "elapsed_seconds": round(time.time() - start_ts, 3),
-                "error_type": "RateLimitError",
-                "error": human_msg,
-                "response_text": "",
-            }
+            record["status"] = "error"
+            record["elapsed_seconds"] = round(time.time() - start_ts, 3)
+            record["error_type"] = "RateLimitError"
+            record["error"] = human_msg
+            record["remote_file_id"] = remote_file_id
+            record["response_id"] = response_id
+
             append_jsonl(log_path, record)
             if csv_path:
                 append_csv(csv_path, record)
@@ -402,21 +656,14 @@ def main():
                 break
 
         except Exception as e:
-            record = {
-                "status": "error",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "file_name": filepath.name,
-                "file_path": str(filepath),
-                "file_size_bytes": filepath.stat().st_size if filepath.exists() else "",
-                "remote_file_id": remote_file_id,
-                "model": args.model,
-                "response_id": response_id,
-                "elapsed_seconds": round(time.time() - start_ts, 3),
-                "error_type": type(e).__name__,
-                "error": str(e),
-                "response_text": "",
-                "traceback": traceback.format_exc(),
-            }
+            record["status"] = "error"
+            record["elapsed_seconds"] = round(time.time() - start_ts, 3)
+            record["error_type"] = type(e).__name__
+            record["error"] = str(e)
+            record["remote_file_id"] = remote_file_id
+            record["response_id"] = response_id
+            record["traceback"] = traceback.format_exc()
+
             append_jsonl(log_path, record)
             if csv_path:
                 append_csv(csv_path, record)
