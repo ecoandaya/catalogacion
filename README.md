@@ -25,53 +25,31 @@ Está pensado para **procesar grandes lotes de documentos**.
 ✔ Control de pausa entre peticiones  
 ✔ Prompt configurable  
 
----
-
 # Requisitos
 
 - Linux / MacOS
 - Python **3.9 o superior**
 - Cuenta de OpenAI
 - API Key de OpenAI
----
 # Instalación
 Clonar el repositorio:
-```
 git clone [https://github.com/TUUSUARIO/openai-file-processor.git](https://github.com/TUUSUARIO/openai-file-processor.git)
 cd openai-file-processor
-```
 Crear entorno virtual:
-```
 python3 -m venv .venv
-```
 Activarlo:
-```
 source .venv/bin/activate
-``
 Instalar dependencias:
-```
 pip install openai
-```
----
 # Configuración
 Definir la API key:
-```
 export OPENAI_API_KEY="tu_api_key"
-```
 Para hacerlo permanente:
-```
 echo 'export OPENAI_API_KEY="tu_api_key"' >> ~/.bashrc
 source ~/.bashrc
-```
----
 # Uso básico
-
 Procesar una carpeta:
-```
 python procesar_carpeta_openai.py /ruta/a/los/archivos
-```
----
-
 # Opciones disponibles
 
 | Opción | Descripción |
