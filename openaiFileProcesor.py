@@ -99,12 +99,18 @@ def print_progress(current: int, total: int, filename: str) -> None:
 
 
 def make_prompt(prompt_template: str, filename: str, filepath: Path) -> str:
-    return prompt_template.format(
-        filename=filename,
-        filepath=str(filepath),
-        stem=filepath.stem,
-        suffix=filepath.suffix,
-    )
+    replacements = {
+        "{filename}": filename,
+        "{filepath}": str(filepath),
+        "{stem}": filepath.stem,
+        "{suffix}": filepath.suffix,
+    }
+
+    prompt = prompt_template
+    for key, value in replacements.items():
+        prompt = prompt.replace(key, value)
+
+    return prompt
 
 
 def clean_extracted_text(text: str) -> str:
